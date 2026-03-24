@@ -1,0 +1,4 @@
+2026-03-10 10:00:01 INFO User login email=admin@company.com
+2026-03-10 10:00:02 DEBUG password=admin123
+2026-03-10 10:00:03 INFO api_key=sk-prod-xyz123abc456def789
+2026-03-10 10:00:04 ERROR NullPointerException at service.java:45
