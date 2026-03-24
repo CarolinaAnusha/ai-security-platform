@@ -5,19 +5,41 @@ const multer = require("multer")
 const fs = require("fs")
 const path = require("path")
 const Groq = require("groq-sdk")
+const rateLimit = require("express-rate-limit")
 
 const app = express()
 const PORT = 5000
 
+// ─────────────────────────────────────────
+// RATE LIMITING
+// ─────────────────────────────────────────
+const generalLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100,
+    message: { error: "Too many requests, please try again later." }
+})
 
+const fileLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20, // stricter for file uploads
+    message: { error: "Too many file uploads, please try again later." }
+})
+
+app.use(generalLimiter)
+app.use(cors())
+
+// Skip JSON parsing for file upload route
 app.use((req, res, next) => {
     if (req.path === "/analyze/file") return next()
     express.json({ limit: "10mb" })(req, res, next)
 })
-app.use(cors())
 
+// Groq setup
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 
+// ─────────────────────────────────────────
+// FILE UPLOAD CONFIG
+// ─────────────────────────────────────────
 const upload = multer({
     dest: "uploads/",
     limits: { fileSize: 10 * 1024 * 1024 },
@@ -29,10 +51,105 @@ const upload = multer({
     }
 })
 
-function readFileContent(filePath, originalName) {
+function readFileContent(filePath) {
     return fs.readFileSync(filePath, "utf-8")
 }
 
+// ─────────────────────────────────────────
+// SQL ANALYZER
+// ─────────────────────────────────────────
+function analyzeSQL(content) {
+    const findings = []
+    const lines = content.split("\n")
+
+    lines.forEach((line, index) => {
+        const lineNum = index + 1
+        const lower = line.toLowerCase()
+
+        // SQL Injection patterns
+        if (/(\bor\b|\band\b)\s+['"]?\d+['"]?\s*=\s*['"]?\d+['"]?/i.test(line) ||
+            /'\s*(or|and)\s+'?\w+'?\s*=\s*'?\w+/i.test(line) ||
+            /union\s+select/i.test(line)) {
+            findings.push({ type: "sql_injection", value: line.trim(), risk: "critical", line: lineNum })
+        }
+
+        // Sensitive data in SQL
+        if (/insert\s+into.*password/i.test(line) || /update.*set.*password/i.test(line)) {
+            findings.push({ type: "password_in_sql", value: maskValue(line), risk: "critical", line: lineNum })
+        }
+
+        // DROP/DELETE without WHERE
+        if (/drop\s+table/i.test(line)) {
+            findings.push({ type: "destructive_query", value: line.trim(), risk: "critical", line: lineNum })
+        }
+
+        if (/delete\s+from\s+\w+\s*;/i.test(line) && !/where/i.test(line)) {
+            findings.push({ type: "delete_without_where", value: line.trim(), risk: "high", line: lineNum })
+        }
+
+        // Exposed credentials in SQL
+        if (/password\s*=\s*['"][^'"]+['"]/i.test(line)) {
+            findings.push({ type: "hardcoded_credential", value: maskValue(line), risk: "critical", line: lineNum })
+        }
+
+        // SELECT * (data exposure)
+        if (/select\s+\*/i.test(line)) {
+            findings.push({ type: "select_all", value: line.trim(), risk: "low", line: lineNum })
+        }
+    })
+
+    return findings
+}
+
+// ─────────────────────────────────────────
+// CHAT ANALYZER
+// ─────────────────────────────────────────
+function analyzeChat(content) {
+    const findings = []
+    const lines = content.split("\n")
+
+    lines.forEach((line, index) => {
+        const lineNum = index + 1
+
+        // PII in chat
+        const emailMatch = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}/g)
+        if (emailMatch) {
+            emailMatch.forEach(email => {
+                findings.push({ type: "email_in_chat", value: email, risk: "low", line: lineNum })
+            })
+        }
+
+        // Phone numbers
+        if (/(\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/.test(line)) {
+            findings.push({ type: "phone_in_chat", value: line.trim(), risk: "low", line: lineNum })
+        }
+
+        // Credentials shared in chat
+        if (/password\s*[=:is]\s*\S+/i.test(line)) {
+            findings.push({ type: "password_in_chat", value: maskValue(line), risk: "critical", line: lineNum })
+        }
+
+        if (/api[_-]?key\s*[=:is]\s*\S+/i.test(line) || /token\s*[=:is]\s*\S+/i.test(line)) {
+            findings.push({ type: "credential_in_chat", value: maskValue(line), risk: "high", line: lineNum })
+        }
+
+        // Social engineering patterns
+        if (/click\s+(this\s+)?link|verify\s+your\s+account|urgent.*action|suspended.*account/i.test(line)) {
+            findings.push({ type: "social_engineering", value: line.trim(), risk: "high", line: lineNum })
+        }
+
+        // Credit card pattern
+        if (/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/.test(line)) {
+            findings.push({ type: "credit_card", value: "****-****-****-" + line.match(/\d{4}$/)?.[0], risk: "critical", line: lineNum })
+        }
+    })
+
+    return findings
+}
+
+// ─────────────────────────────────────────
+// DETECTION ENGINE (logs/text)
+// ─────────────────────────────────────────
 function detectSensitiveData(content) {
     const findings = []
     const lines = content.split("\n")
@@ -126,7 +243,9 @@ function maskValue(line) {
     })
 }
 
-
+// ─────────────────────────────────────────
+// RISK ENGINE
+// ─────────────────────────────────────────
 const RISK_WEIGHTS = { critical: 5, high: 3, medium: 2, low: 1 }
 
 function calculateRisk(findings) {
@@ -139,19 +258,23 @@ function calculateRisk(findings) {
     return { score, level }
 }
 
-
+// ─────────────────────────────────────────
+// POLICY ENGINE
+// ─────────────────────────────────────────
 function applyPolicy(findings, riskData, options = {}) {
     const actions = []
     if (options.block_high_risk && (riskData.level === "high" || riskData.level === "critical")) {
         actions.push("blocked")
     }
     if (options.mask) actions.push("masked")
-    const criticalTypes = ["password", "api_key", "token", "hardcoded_secret"]
+    const criticalTypes = ["password", "api_key", "token", "hardcoded_secret", "sql_injection", "password_in_chat", "credit_card"]
     if (findings.some(f => criticalTypes.includes(f.type))) actions.push("alert_raised")
     return actions.length > 0 ? actions.join(", ") : "logged"
 }
 
-
+// ─────────────────────────────────────────
+// STATIC INSIGHTS (fallback)
+// ─────────────────────────────────────────
 function generateStaticInsights(findings) {
     const insights = []
     const types = findings.map(f => f.type)
@@ -162,13 +285,19 @@ function generateStaticInsights(findings) {
     if (types.includes("stack_trace")) insights.push("Stack traces reveal internal system structure — disable verbose errors in production")
     if (types.includes("brute_force")) insights.push("Brute-force login pattern detected — consider IP blocking or rate limiting")
     if (types.includes("debug_leak")) insights.push("Debug mode enabled in production — disable immediately")
-    if (types.includes("phone_number")) insights.push("Phone numbers present in logs — review PII logging policy")
-    if (types.includes("email")) insights.push("User email addresses present in logs — review logging policy for PII compliance")
-    if (insights.length === 0) insights.push("No critical issues detected — logs appear clean")
+    if (types.includes("phone_number") || types.includes("phone_in_chat")) insights.push("Phone numbers present — review PII logging policy")
+    if (types.includes("email") || types.includes("email_in_chat")) insights.push("Email addresses present — review logging policy for PII compliance")
+    if (types.includes("sql_injection")) insights.push("SQL injection pattern detected — sanitize all inputs immediately")
+    if (types.includes("social_engineering")) insights.push("Social engineering pattern detected — educate users about phishing")
+    if (types.includes("credit_card")) insights.push("Credit card number detected — PCI DSS violation, mask immediately")
+    if (insights.length === 0) insights.push("No critical issues detected — content appears clean")
     return insights
 }
 
-async function generateAIInsights(findings, riskData, logSample) {
+// ─────────────────────────────────────────
+// AI INSIGHTS via Groq
+// ─────────────────────────────────────────
+async function generateAIInsights(findings, riskData, logSample, inputType) {
     try {
         const findingsSummary = findings.map(f =>
             `Line ${f.line || "N/A"}: [${f.type.toUpperCase()}] risk=${f.risk} — ${f.value}`
@@ -183,7 +312,7 @@ async function generateAIInsights(findings, riskData, logSample) {
                 },
                 {
                     role: "user",
-                    content: `Log sample:\n${logSample.substring(0, 500)}\n\nFindings:\n${findingsSummary}\n\nOverall risk: ${riskData.level} (score: ${riskData.score})\n\nGive 3-5 specific actionable security insights referencing exact line numbers and finding types. Return ONLY a JSON array of strings.`
+                    content: `Input type: ${inputType}\nContent sample:\n${logSample.substring(0, 500)}\n\nFindings:\n${findingsSummary}\n\nOverall risk: ${riskData.level} (score: ${riskData.score})\n\nGive 3-5 specific actionable security insights referencing exact line numbers and finding types. Return ONLY a JSON array of strings.`
                 }
             ],
             temperature: 0.3,
@@ -205,7 +334,9 @@ async function generateAIInsights(findings, riskData, logSample) {
     }
 }
 
-
+// ─────────────────────────────────────────
+// TIMELINE BUILDER
+// ─────────────────────────────────────────
 function buildTimeline(content, findings) {
     const lines = content.split("\n")
     const timestampRegex = /\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}/
@@ -230,15 +361,46 @@ function buildTimeline(content, findings) {
     return timeline.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
 }
 
+// ─────────────────────────────────────────
+// CHUNK LARGE LOGS
+// ─────────────────────────────────────────
+function chunkContent(content, chunkSize = 1000) {
+    const lines = content.split("\n")
+    const chunks = []
+    for (let i = 0; i < lines.length; i += chunkSize) {
+        chunks.push(lines.slice(i, i + chunkSize).join("\n"))
+    }
+    return chunks
+}
 
+// ─────────────────────────────────────────
+// SHARED ANALYSIS LOGIC
+// ─────────────────────────────────────────
 async function analyzeContent(content, inputType, options) {
-    const findings = detectSensitiveData(content)
+    let findings = []
+
+    // Route to correct analyzer based on input type
+    if (inputType === "sql") {
+        findings = analyzeSQL(content)
+    } else if (inputType === "chat") {
+        findings = analyzeChat(content)
+    } else {
+        // Handle large logs by chunking
+        const lines = content.split("\n")
+        if (lines.length > 1000) {
+            const chunks = chunkContent(content, 1000)
+            chunks.forEach(chunk => {
+                findings = findings.concat(detectSensitiveData(chunk))
+            })
+        } else {
+            findings = detectSensitiveData(content)
+        }
+    }
+
     const riskData = calculateRisk(findings)
     const action = applyPolicy(findings, riskData, options)
     const timeline = buildTimeline(content, findings)
-
-    
-    const { insights, source: insightSource } = await generateAIInsights(findings, riskData, content)
+    const { insights, source: insightSource } = await generateAIInsights(findings, riskData, content, inputType)
 
     const criticalCount = findings.filter(f => f.risk === "critical").length
     const highCount = findings.filter(f => f.risk === "high").length
@@ -264,7 +426,11 @@ async function analyzeContent(content, inputType, options) {
     }
 }
 
+// ─────────────────────────────────────────
+// ROUTES
+// ─────────────────────────────────────────
 
+// Text / JSON / SQL / Chat input
 app.post("/analyze", async (req, res) => {
     const { content, input_type = "text", options = {} } = req.body
     if (!content) return res.status(400).json({ error: "No content provided" })
@@ -272,12 +438,12 @@ app.post("/analyze", async (req, res) => {
     return res.json(result)
 })
 
-
-app.post("/analyze/file", upload.single("file"), async (req, res) => {
+// File upload
+app.post("/analyze/file", fileLimiter, upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" })
 
     try {
-        const content = readFileContent(req.file.path, req.file.originalname)
+        const content = readFileContent(req.file.path)
         let options = {}
         try {
             if (req.body.options && req.body.options !== "null" && req.body.options !== "") {
@@ -302,11 +468,18 @@ app.post("/analyze/file", upload.single("file"), async (req, res) => {
     }
 })
 
-
+// Health check
 app.get("/health", (req, res) => {
-    res.json({ status: "ok", version: "3.0.0", ai: "groq-llama3" })
+    res.json({
+        status: "ok",
+        version: "4.0.0",
+        ai: "groq-llama-3.1",
+        supported_inputs: ["text", "log", "file", "sql", "chat"],
+        endpoints: ["/analyze", "/analyze/file"]
+    })
 })
 
+// Error handler
 app.use((err, req, res, next) => {
     if (err instanceof multer.MulterError || err.message.includes("not supported")) {
         return res.status(400).json({ error: err.message })
