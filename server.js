@@ -8,41 +8,63 @@ const Groq = require("groq-sdk")
 const rateLimit = require("express-rate-limit")
 
 const app = express()
-const PORT = 5000
+const PORT = process.env.PORT || 5000
 
 // ─────────────────────────────────────────
 // RATE LIMITING
 // ─────────────────────────────────────────
 const generalLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
+    windowMs: 15 * 60 * 1000,
     max: 100,
     message: { error: "Too many requests, please try again later." }
 })
 
 const fileLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 20, // stricter for file uploads
+    max: 20,
     message: { error: "Too many file uploads, please try again later." }
 })
 
 app.use(generalLimiter)
-app.use(cors())
 
-// Skip JSON parsing for file upload route
+// ── FIXED: CORS reads allowed origins from env ──
+const allowedOrigins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    process.env.FRONTEND_URL,
+].filter(Boolean)
+
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin) return callback(null, true)
+        if (allowedOrigins.includes(origin)) return callback(null, true)
+        callback(new Error(`CORS: origin ${origin} not allowed`))
+    },
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+}))
+
 app.use((req, res, next) => {
     if (req.path === "/analyze/file") return next()
     express.json({ limit: "10mb" })(req, res, next)
 })
 
-// Groq setup
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+// ── FIXED: Warn if key missing instead of crashing ──
+if (!process.env.GROQ_API_KEY) {
+    console.warn("⚠  GROQ_API_KEY not set — AI insights will use static fallback")
+}
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || "missing" })
 
 // ─────────────────────────────────────────
 // FILE UPLOAD CONFIG
+// ── FIXED: Use /tmp in production (Render has ephemeral filesystem) ──
 // ─────────────────────────────────────────
+const uploadDir = process.env.NODE_ENV === "production" ? "/tmp/uploads" : "uploads/"
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
+
 const upload = multer({
-    dest: "uploads/",
-    limits: { fileSize: 10 * 1024 * 1024 },
+    dest: uploadDir,
+    limits: { fileSize: 50 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         const allowed = [".log", ".txt", ".pdf", ".doc", ".docx"]
         const ext = path.extname(file.originalname).toLowerCase()
@@ -64,35 +86,24 @@ function analyzeSQL(content) {
 
     lines.forEach((line, index) => {
         const lineNum = index + 1
-        const lower = line.toLowerCase()
 
-        // SQL Injection patterns
         if (/(\bor\b|\band\b)\s+['"]?\d+['"]?\s*=\s*['"]?\d+['"]?/i.test(line) ||
             /'\s*(or|and)\s+'?\w+'?\s*=\s*'?\w+/i.test(line) ||
             /union\s+select/i.test(line)) {
             findings.push({ type: "sql_injection", value: line.trim(), risk: "critical", line: lineNum })
         }
-
-        // Sensitive data in SQL
         if (/insert\s+into.*password/i.test(line) || /update.*set.*password/i.test(line)) {
             findings.push({ type: "password_in_sql", value: maskValue(line), risk: "critical", line: lineNum })
         }
-
-        // DROP/DELETE without WHERE
         if (/drop\s+table/i.test(line)) {
             findings.push({ type: "destructive_query", value: line.trim(), risk: "critical", line: lineNum })
         }
-
         if (/delete\s+from\s+\w+\s*;/i.test(line) && !/where/i.test(line)) {
             findings.push({ type: "delete_without_where", value: line.trim(), risk: "high", line: lineNum })
         }
-
-        // Exposed credentials in SQL
         if (/password\s*=\s*['"][^'"]+['"]/i.test(line)) {
             findings.push({ type: "hardcoded_credential", value: maskValue(line), risk: "critical", line: lineNum })
         }
-
-        // SELECT * (data exposure)
         if (/select\s+\*/i.test(line)) {
             findings.push({ type: "select_all", value: line.trim(), risk: "low", line: lineNum })
         }
@@ -111,34 +122,24 @@ function analyzeChat(content) {
     lines.forEach((line, index) => {
         const lineNum = index + 1
 
-        // PII in chat
         const emailMatch = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}/g)
         if (emailMatch) {
             emailMatch.forEach(email => {
                 findings.push({ type: "email_in_chat", value: email, risk: "low", line: lineNum })
             })
         }
-
-        // Phone numbers
         if (/(\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/.test(line)) {
             findings.push({ type: "phone_in_chat", value: line.trim(), risk: "low", line: lineNum })
         }
-
-        // Credentials shared in chat
         if (/password\s*[=:is]\s*\S+/i.test(line)) {
             findings.push({ type: "password_in_chat", value: maskValue(line), risk: "critical", line: lineNum })
         }
-
         if (/api[_-]?key\s*[=:is]\s*\S+/i.test(line) || /token\s*[=:is]\s*\S+/i.test(line)) {
             findings.push({ type: "credential_in_chat", value: maskValue(line), risk: "high", line: lineNum })
         }
-
-        // Social engineering patterns
         if (/click\s+(this\s+)?link|verify\s+your\s+account|urgent.*action|suspended.*account/i.test(line)) {
             findings.push({ type: "social_engineering", value: line.trim(), risk: "high", line: lineNum })
         }
-
-        // Credit card pattern
         if (/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/.test(line)) {
             findings.push({ type: "credit_card", value: "****-****-****-" + line.match(/\d{4}$/)?.[0], risk: "critical", line: lineNum })
         }
@@ -148,7 +149,7 @@ function analyzeChat(content) {
 }
 
 // ─────────────────────────────────────────
-// DETECTION ENGINE (logs/text)
+// DETECTION ENGINE
 // ─────────────────────────────────────────
 function detectSensitiveData(content) {
     const findings = []
@@ -158,20 +159,15 @@ function detectSensitiveData(content) {
     lines.forEach((line, index) => {
         const lineNum = index + 1
 
-        // EMAIL
         const emailMatch = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}/g)
         if (emailMatch) {
             emailMatch.forEach(email => {
                 findings.push({ type: "email", value: email, risk: "low", line: lineNum })
             })
         }
-
-        // PASSWORD
         if (/password\s*[=:]\s*\S+/i.test(line)) {
             findings.push({ type: "password", value: maskValue(line), risk: "critical", line: lineNum })
         }
-
-        // API KEY
         if (
             /api[_-]?key\s*[=:]\s*\S+/i.test(line) ||
             /sk-[a-zA-Z0-9]{20,}/.test(line) ||
@@ -180,8 +176,6 @@ function detectSensitiveData(content) {
         ) {
             findings.push({ type: "api_key", value: maskValue(line), risk: "high", line: lineNum })
         }
-
-        // TOKEN
         if (
             /token\s*[=:]\s*\S+/i.test(line) ||
             /bearer\s+[a-zA-Z0-9\-._~+/]+=*/i.test(line) ||
@@ -189,13 +183,9 @@ function detectSensitiveData(content) {
         ) {
             findings.push({ type: "token", value: maskValue(line), risk: "high", line: lineNum })
         }
-
-        // PHONE NUMBER
         if (/(\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/.test(line)) {
             findings.push({ type: "phone_number", value: line.trim(), risk: "low", line: lineNum })
         }
-
-        // STACK TRACE
         if (
             /exception|stack trace|traceback|at [a-zA-Z]+\.[a-zA-Z]+\(/i.test(line) ||
             /\w+Error:/i.test(line) ||
@@ -203,18 +193,12 @@ function detectSensitiveData(content) {
         ) {
             findings.push({ type: "stack_trace", value: line.trim(), risk: "medium", line: lineNum })
         }
-
-        // HARDCODED SECRET
         if (/secret\s*[=:]\s*\S+/i.test(line) || /private[_-]?key\s*[=:]\s*\S+/i.test(line)) {
             findings.push({ type: "hardcoded_secret", value: maskValue(line), risk: "critical", line: lineNum })
         }
-
-        // DEBUG LEAK
         if (/debug\s*[=:]\s*true/i.test(line) || /verbose\s*[=:]\s*true/i.test(line)) {
             findings.push({ type: "debug_leak", value: line.trim(), risk: "medium", line: lineNum })
         }
-
-        // BRUTE FORCE
         if (/failed login|login failed|authentication failed|invalid password/i.test(line)) {
             const ipMatch = line.match(/\b(\d{1,3}\.){3}\d{1,3}\b/)
             const ip = ipMatch ? ipMatch[0] : "unknown"
@@ -312,7 +296,7 @@ async function generateAIInsights(findings, riskData, logSample, inputType) {
                 },
                 {
                     role: "user",
-                    content: `Input type: ${inputType}\nContent sample:\n${logSample.substring(0, 500)}\n\nFindings:\n${findingsSummary}\n\nOverall risk: ${riskData.level} (score: ${riskData.score})\n\nGive 3-5 specific actionable security insights referencing exact line numbers and finding types. Return ONLY a JSON array of strings.`
+                    content: `Input type: ${inputType}\nContent sample:\n${logSample.substring(0, 500)}\n\nFindings:\n${findingsSummary}\n\nOverall risk: ${riskData.level} (score: ${riskData.score})\n\nGive 3-5 specific actionable security insights. Return ONLY a JSON array of strings.`
                 }
             ],
             temperature: 0.3,
@@ -379,13 +363,11 @@ function chunkContent(content, chunkSize = 1000) {
 async function analyzeContent(content, inputType, options) {
     let findings = []
 
-    // Route to correct analyzer based on input type
     if (inputType === "sql") {
         findings = analyzeSQL(content)
     } else if (inputType === "chat") {
         findings = analyzeChat(content)
     } else {
-        // Handle large logs by chunking
         const lines = content.split("\n")
         if (lines.length > 1000) {
             const chunks = chunkContent(content, 1000)
@@ -429,16 +411,17 @@ async function analyzeContent(content, inputType, options) {
 // ─────────────────────────────────────────
 // ROUTES
 // ─────────────────────────────────────────
-
-// Text / JSON / SQL / Chat input
 app.post("/analyze", async (req, res) => {
     const { content, input_type = "text", options = {} } = req.body
     if (!content) return res.status(400).json({ error: "No content provided" })
-    const result = await analyzeContent(content, input_type, options)
-    return res.json(result)
+    try {
+        const result = await analyzeContent(content, input_type, options)
+        return res.json(result)
+    } catch (err) {
+        return res.status(500).json({ error: "Analysis failed", details: err.message })
+    }
 })
 
-// File upload
 app.post("/analyze/file", fileLimiter, upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" })
 
@@ -468,25 +451,27 @@ app.post("/analyze/file", fileLimiter, upload.single("file"), async (req, res) =
     }
 })
 
-// Health check
 app.get("/health", (req, res) => {
     res.json({
         status: "ok",
         version: "4.0.0",
         ai: "groq-llama-3.1",
+        groq_configured: !!process.env.GROQ_API_KEY,
         supported_inputs: ["text", "log", "file", "sql", "chat"],
         endpoints: ["/analyze", "/analyze/file"]
     })
 })
 
-// Error handler
 app.use((err, req, res, next) => {
     if (err instanceof multer.MulterError || err.message.includes("not supported")) {
         return res.status(400).json({ error: err.message })
     }
-    next(err)
+    console.error(err)
+    res.status(500).json({ error: "Internal server error" })
 })
 
 app.listen(PORT, () => {
-    console.log(`Server running on http://localhost:${PORT}`)
+    console.log(`✅ Server running on http://localhost:${PORT}`)
+    console.log(`   GROQ_API_KEY: ${process.env.GROQ_API_KEY ? "✅ set" : "❌ missing — AI insights will fall back to static"}`)
+    console.log(`   FRONTEND_URL: ${process.env.FRONTEND_URL || "not set (localhost only)"}`)
 })
