@@ -1,0 +1,32 @@
+services:
+  # ── BACKEND ──────────────────────────────────
+  - type: web
+    name: ai-security-backend
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: FRONTEND_URL
+        fromService:
+          name: ai-security-frontend
+          type: web
+          property: host
+
+  # ── FRONTEND ─────────────────────────────────
+  - type: web
+    name: ai-security-frontend
+    runtime: node
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    startCommand: npx serve -s build -l 3000
+    envVars:
+      - key: REACT_APP_API_URL
+        fromService:
+          name: ai-security-backend
+          type: web
+          property: host
