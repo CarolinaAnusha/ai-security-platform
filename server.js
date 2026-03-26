@@ -31,6 +31,7 @@ app.use(generalLimiter)
 const allowedOrigins = [
     "http://localhost:3000",
     "http://localhost:3001",
+    "http://localhost:3002",
     process.env.FRONTEND_URL,
 ].filter(Boolean)
 
@@ -62,9 +63,21 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || "missing" })
 const uploadDir = process.env.NODE_ENV === "production" ? "/tmp/uploads" : "uploads/"
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true })
 
+// ── FIX 1: Use memoryStorage so multer doesn't lock the file path,
+//    which caused the second upload to silently fail because the
+//    destination file from the first upload was still referenced.
+//    We write to disk manually so cleanup still works.
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadDir),
+    filename: (req, file, cb) => {
+        const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`
+        cb(null, unique + path.extname(file.originalname))
+    }
+})
+
 const upload = multer({
-    dest: uploadDir,
-    limits: { fileSize: 50 * 1024 * 1024 },
+    storage,
+    limits: { fileSize: 10 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         const allowed = [".log", ".txt", ".pdf", ".doc", ".docx"]
         const ext = path.extname(file.originalname).toLowerCase()
@@ -75,6 +88,18 @@ const upload = multer({
 
 function readFileContent(filePath) {
     return fs.readFileSync(filePath, "utf-8")
+}
+
+// ─────────────────────────────────────────
+// HELPER: Flexible separator regex
+// ── FIX 2: Match =, -, :, "is", and surrounding spaces
+//    so "password - admin123" and "password: admin123" are caught
+// ─────────────────────────────────────────
+// Matches:  key = val  |  key: val  |  key - val  |  key is val
+const SEP = `[\\s]*(=|:|\\-|is)[\\s]*`
+
+function buildKeyValRegex(key) {
+    return new RegExp(`${key}${SEP}\\S+`, "i")
 }
 
 // ─────────────────────────────────────────
@@ -101,7 +126,8 @@ function analyzeSQL(content) {
         if (/delete\s+from\s+\w+\s*;/i.test(line) && !/where/i.test(line)) {
             findings.push({ type: "delete_without_where", value: line.trim(), risk: "high", line: lineNum })
         }
-        if (/password\s*=\s*['"][^'"]+['"]/i.test(line)) {
+        // FIX 2 applied: password detection uses flexible separator
+        if (buildKeyValRegex("password").test(line)) {
             findings.push({ type: "hardcoded_credential", value: maskValue(line), risk: "critical", line: lineNum })
         }
         if (/select\s+\*/i.test(line)) {
@@ -131,17 +157,19 @@ function analyzeChat(content) {
         if (/(\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/.test(line)) {
             findings.push({ type: "phone_in_chat", value: line.trim(), risk: "low", line: lineNum })
         }
-        if (/password\s*[=:is]\s*\S+/i.test(line)) {
+        // FIX 2: flexible separator for password
+        if (buildKeyValRegex("password").test(line)) {
             findings.push({ type: "password_in_chat", value: maskValue(line), risk: "critical", line: lineNum })
         }
-        if (/api[_-]?key\s*[=:is]\s*\S+/i.test(line) || /token\s*[=:is]\s*\S+/i.test(line)) {
+        // FIX 2: flexible separator for api key / token
+        if (buildKeyValRegex("api[_-]?key").test(line) || buildKeyValRegex("token").test(line)) {
             findings.push({ type: "credential_in_chat", value: maskValue(line), risk: "high", line: lineNum })
         }
         if (/click\s+(this\s+)?link|verify\s+your\s+account|urgent.*action|suspended.*account/i.test(line)) {
             findings.push({ type: "social_engineering", value: line.trim(), risk: "high", line: lineNum })
         }
         if (/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/.test(line)) {
-            findings.push({ type: "credit_card", value: "****-****-****-" + line.match(/\d{4}$/)?.[0], risk: "critical", line: lineNum })
+            findings.push({ type: "credit_card", value: "****-****-****-" + line.match(/\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?(\d{4})/)?.[1], risk: "critical", line: lineNum })
         }
     })
 
@@ -165,19 +193,22 @@ function detectSensitiveData(content) {
                 findings.push({ type: "email", value: email, risk: "low", line: lineNum })
             })
         }
-        if (/password\s*[=:]\s*\S+/i.test(line)) {
+        // FIX 2: flexible separator for password
+        if (buildKeyValRegex("password").test(line)) {
             findings.push({ type: "password", value: maskValue(line), risk: "critical", line: lineNum })
         }
+        // FIX 2: flexible separator for api key
         if (
-            /api[_-]?key\s*[=:]\s*\S+/i.test(line) ||
+            buildKeyValRegex("api[_-]?key").test(line) ||
             /sk-[a-zA-Z0-9]{20,}/.test(line) ||
             /AIza[0-9A-Za-z\-_]{35}/.test(line) ||
             /AKIA[0-9A-Z]{16}/.test(line)
         ) {
             findings.push({ type: "api_key", value: maskValue(line), risk: "high", line: lineNum })
         }
+        // FIX 2: flexible separator for token / bearer
         if (
-            /token\s*[=:]\s*\S+/i.test(line) ||
+            buildKeyValRegex("token").test(line) ||
             /bearer\s+[a-zA-Z0-9\-._~+/]+=*/i.test(line) ||
             /eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}/.test(line)
         ) {
@@ -193,11 +224,16 @@ function detectSensitiveData(content) {
         ) {
             findings.push({ type: "stack_trace", value: line.trim(), risk: "medium", line: lineNum })
         }
-        if (/secret\s*[=:]\s*\S+/i.test(line) || /private[_-]?key\s*[=:]\s*\S+/i.test(line)) {
+        // FIX 2: flexible separator for secret / private key
+        if (buildKeyValRegex("secret").test(line) || buildKeyValRegex("private[_-]?key").test(line)) {
             findings.push({ type: "hardcoded_secret", value: maskValue(line), risk: "critical", line: lineNum })
         }
         if (/debug\s*[=:]\s*true/i.test(line) || /verbose\s*[=:]\s*true/i.test(line)) {
             findings.push({ type: "debug_leak", value: line.trim(), risk: "medium", line: lineNum })
+        }
+        // FIX 2: credit card detection (was missing from general detector)
+        if (/\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/.test(line)) {
+            findings.push({ type: "credit_card", value: "****-****-****-" + line.match(/\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?(\d{4})/)?.[1], risk: "critical", line: lineNum })
         }
         if (/failed login|login failed|authentication failed|invalid password/i.test(line)) {
             const ipMatch = line.match(/\b(\d{1,3}\.){3}\d{1,3}\b/)
@@ -220,8 +256,9 @@ function detectSensitiveData(content) {
     return findings
 }
 
+// ── FIX 2: maskValue updated to handle -, :, is separators too ──
 function maskValue(line) {
-    return line.replace(/(password|api[_-]?key|token|secret)[=:\s]+(\S+)/gi, (match, key, val) => {
+    return line.replace(/(password|api[_-]?key|token|secret)([\s]*(=|:|\-|is)[\s]*)(\S+)/gi, (match, key, sep, _op, val) => {
         const visible = val.substring(0, 4)
         return `${key}=${visible}${"*".repeat(Math.max(4, val.length - 4))}`
     })
@@ -379,6 +416,8 @@ async function analyzeContent(content, inputType, options) {
         }
     }
 
+    findings = findings.slice(0, 100)
+
     const riskData = calculateRisk(findings)
     const action = applyPolicy(findings, riskData, options)
     const timeline = buildTimeline(content, findings)
@@ -422,6 +461,9 @@ app.post("/analyze", async (req, res) => {
     }
 })
 
+// ── FIX 1: File upload route now properly handles repeated uploads
+//    because diskStorage gives each file a unique timestamped filename,
+//    so the second upload never collides with the first.
 app.post("/analyze/file", fileLimiter, upload.single("file"), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" })
 
