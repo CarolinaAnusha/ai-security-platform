@@ -1,7 +1,7 @@
 import { useState, useRef } from "react";
 import axios from "axios";
 
-const API = process.env.REACT_APP_API_URL || "http://localhost:5000";
+const API = process.env.REACT_APP_API_URL || "https://ai-security-platform.onrender.com";
 
 const RISK_COLORS = {
   critical: { bg: "#ff000018", border: "#ff4444", text: "#ff4444", badge: "#ff4444" },
